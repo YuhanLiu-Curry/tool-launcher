@@ -18,12 +18,30 @@ shell32 = ctypes.windll.shell32
 
 # Shell_NotifyIcon constants
 NIM_ADD = 0
-NIM_MODIFY = 1
 NIM_DELETE = 2
 NIF_MESSAGE = 1
 NIF_ICON = 2
 NIF_TIP = 4
-WM_TRAY_CALLBACK = 0x4000 + 1
+WM_TRAY_CALLBACK = 0x8000
+
+# PeekMessageW for polling tray messages
+PM_REMOVE = 1
+
+class POINT(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ('hwnd', ctypes.wintypes.HWND),
+        ('message', ctypes.c_uint),
+        ('wParam', ctypes.wintypes.WPARAM),
+        ('lParam', ctypes.wintypes.LPARAM),
+        ('time', ctypes.c_ulong),
+        ('pt', POINT),
+    ]
+
+user32.PeekMessageW.argtypes = [ctypes.c_void_p, ctypes.wintypes.HWND, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+user32.PeekMessageW.restype = ctypes.c_int
 
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
@@ -37,11 +55,17 @@ class NOTIFYICONDATAW(ctypes.Structure):
     ]
 
 # ---- Config ----
-TOOLS_FILE = os.path.join(os.path.dirname(__file__), 'tools.json')
+BASE_DIR = os.path.dirname(__file__)
+TOOLS_FILE = os.path.join(BASE_DIR, 'tools.json')
+ICON_FILE = os.path.join(BASE_DIR, 'tray.ico')
 REFRESH_INTERVAL = 3000  # ms
 FLOAT_W = 260
 ROW_H = 44
 HEADER_H = 36
+
+# LoadImage constants
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x00000010
 
 # ---- Color scheme ----
 BG_COLOR = '#f8fafc'
@@ -180,6 +204,12 @@ class ToolLauncher:
         self.root.configure(bg='white')
         self.root.geometry(f'{FLOAT_W}x1')
 
+        # Window icon (taskbar / Alt+Tab)
+        try:
+            self.root.iconbitmap(ICON_FILE)
+        except Exception:
+            pass
+
         # Keep on top by default (user can toggle with pin button)
         self.root.attributes('-topmost', True)
 
@@ -187,7 +217,7 @@ class ToolLauncher:
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f'+{sw - FLOAT_W - 20}+80')
 
-        # Close → minimize to taskbar (window stays accessible via taskbar icon)
+        # Close → minimize to taskbar (taskbar icon stays, click to restore)
         self.root.protocol('WM_DELETE_WINDOW', self._minimize_window)
 
     # ---- System Tray Icon ----
@@ -204,25 +234,33 @@ class ToolLauncher:
         self._nid.uFlags = NIF_MESSAGE | NIF_TIP
         self._nid.uCallbackMessage = WM_TRAY_CALLBACK
         self._nid.szTip = '🧰 工具箱'
-
-        # Use standard application icon (not IDI_QUESTION)
         self._nid.uFlags |= NIF_ICON
-        self._nid.hIcon = user32.LoadIconW(None, 32512)  # IDI_APPLICATION
+        hIcon = user32.LoadImageW(None, ICON_FILE, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+        if hIcon:
+            self._nid.hIcon = hIcon
+        else:
+            self._nid.hIcon = user32.LoadIconW(None, 32512)
 
         shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
-        print('Tray icon added')
 
-        self._poll_tray()
+        # Start polling for tray messages (avoids WINFUNCTYPE callback / GIL issues on Python 3.14)
+        self._poll_tray_messages()
 
-    def _poll_tray(self):
-        msg = ctypes.wintypes.MSG()
-        while user32.PeekMessageW(ctypes.byref(msg), None, WM_TRAY_CALLBACK, WM_TRAY_CALLBACK, 1):
-            if msg.message == WM_TRAY_CALLBACK:
-                if msg.lParam == 0x202:  # WM_LBUTTONUP
-                    self._toggle_window()
-                elif msg.lParam == 0x205:  # WM_RBUTTONUP
-                    self._show_tray_menu()
-        self.root.after(200, self._poll_tray)
+    def _poll_tray_messages(self):
+        """Poll message queue for WM_TRAY_CALLBACK messages via PeekMessageW.
+        No window subclassing needed — tkinter handles its own messages normally."""
+        hwnd = self.root.winfo_id()
+        msg = MSG()
+        while user32.PeekMessageW(
+            ctypes.byref(msg), hwnd,
+            WM_TRAY_CALLBACK, WM_TRAY_CALLBACK, PM_REMOVE
+        ):
+            lparam = msg.lParam
+            if lparam == 0x202:  # WM_LBUTTONUP
+                self._toggle_window()
+            elif lparam == 0x205:  # WM_RBUTTONUP
+                self._show_tray_menu()
+        self.root.after(200, self._poll_tray_messages)
 
     def _remove_tray(self):
         try:
@@ -234,14 +272,34 @@ class ToolLauncher:
         pos = ctypes.wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pos))
 
+        # Bring window up so the popup menu can display
+        self.root.deiconify()
+        self.root.update_idletasks()
+        user32.SetForegroundWindow(self.root.winfo_id())
+
         menu = tk.Menu(self.root, tearoff=0, font=('Segoe UI', 10))
-        menu.add_command(label='📂 显示/隐藏', command=self._toggle_window)
+        menu.add_command(label='📂 显示/隐藏面板', command=self._toggle_window)
+        menu.add_separator()
+
+        for tool in self.manager.tools:
+            name = tool['name']
+            icon = tool.get('icon', '🔧')
+            running = self.manager.is_running(tool)
+            status = '● 已运行' if running else '○ 未启动'
+            menu.add_command(
+                label=f'{icon} {name} — {status}',
+                command=lambda t=tool: self._on_click(t)
+            )
+            if running:
+                menu.add_command(
+                    label=f'   ⏹ 停止 {name}',
+                    command=lambda t=tool: self._stop_tool(t)
+                )
+
         menu.add_separator()
         menu.add_command(label='⏹ 退出', command=self._quit)
 
-        user32.SetForegroundWindow(self.root.winfo_id())
         menu.tk_popup(pos.x, pos.y)
-        menu.bind('<Destroy>', lambda e: None)
 
     # ---- UI ----
     def _setup_ui(self):
@@ -505,13 +563,17 @@ class ToolLauncher:
         lbl = self.rows[name]['status']
         lbl.configure(text='●' if running else '○', fg=GREEN if running else GRAY)
 
-    # ---- Window management (taskbar-based) ----
+    # ---- Window management ----
+    def _hide_window(self):
+        """Close → hide to tray. Restore via tray icon click."""
+        self.root.withdraw()
+
     def _minimize_window(self):
-        """Close button → minimize to taskbar."""
+        """Minimize to taskbar."""
         self.root.iconify()
 
     def _restore_window(self):
-        """Restore from minimized state."""
+        """Restore from hidden or minimized state."""
         self.root.deiconify()
         hwnd = self.root.winfo_id()
         user32.SetForegroundWindow(hwnd)
@@ -521,7 +583,7 @@ class ToolLauncher:
         self.root.focus_force()
 
     def _toggle_window(self):
-        """Tray icon click → toggle between minimized and normal."""
+        """Tray icon click → toggle minimize/restore."""
         state = self.root.state()
         if state == 'iconic' or state == 'withdrawn':
             self._restore_window()
