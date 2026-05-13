@@ -4,7 +4,7 @@
     "desc": "管理微信收藏、链接和笔记",
     "icon": "📑",
     "url": "http://localhost:5000",
-    "start": "python app.py",
+    "start": "python run.py",
     "dir": "D:/projects/bookmark-manager"
   }
 ]
